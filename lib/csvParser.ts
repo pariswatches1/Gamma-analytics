@@ -137,18 +137,21 @@ function parseTOSFormat(content: string): CSVParseResult {
   
   if (data.length === 0) {
     errors.push('No valid option data found in TOS format');
-  } else {
-    warnings.push(`Parsed ${data.length} options from TOS/StockAnalysis format`);
-    if (underlyingPrice > 0) {
-      warnings.push(`Detected underlying price: ${underlyingPrice.toFixed(2)}`);
-    }
+  }
+  
+  // Build info messages (not warnings - these are informational)
+  const info: string[] = [];
+  info.push(`Parsed ${data.length} options from TOS/StockAnalysis format`);
+  if (underlyingPrice > 0) {
+    info.push(`Detected underlying price: ${underlyingPrice.toFixed(2)}`);
   }
   
   return {
     success: data.length > 0,
     data,
     errors,
-    warnings,
+    warnings: [],
+    info,
     rowCount: rowIndex,
     validRowCount: data.length,
   };
