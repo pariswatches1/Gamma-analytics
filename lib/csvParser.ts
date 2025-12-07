@@ -1,6 +1,173 @@
 import Papa from 'papaparse';
 import { OptionData, CSVParseResult, CSVColumnMapping } from './types';
 
+/**
+ * Detect if content is TOS/StockAnalysis format
+ * This format has expiry section headers like "8 DEC 25  (2)  100 (Weeklys)"
+ */
+function isTOSFormat(content: string): boolean {
+  // Look for expiry section headers pattern
+  const expiryPattern = /^\d{1,2}\s+[A-Z]{3}\s+\d{2}\s+\(\d+\)/m;
+  return expiryPattern.test(content);
+}
+
+/**
+ * Parse TOS/StockAnalysis format
+ * This format has call and put data on the same row
+ */
+function parseTOSFormat(content: string): CSVParseResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const data: OptionData[] = [];
+  
+  const lines = content.split('\n');
+  let underlyingPrice = 0;
+  let currentExpiry = '';
+  let rowIndex = 0;
+  
+  // Parse underlying price from header (line 5 typically)
+  for (let i = 0; i < Math.min(10, lines.length); i++) {
+    const line = lines[i];
+    if (line && !line.includes('UNDERLYING') && !line.includes('LAST')) {
+      const parts = line.split(',');
+      if (parts.length > 0) {
+        const price = parseFloat(parts[0].replace(/[^\d.]/g, ''));
+        if (price > 100) { // Likely a stock price
+          underlyingPrice = price;
+          break;
+        }
+      }
+    }
+  }
+  
+  // Month name to number mapping
+  const monthMap: Record<string, string> = {
+    'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+    'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+    'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+  };
+  
+  for (const line of lines) {
+    // Check for expiry section header (e.g., "8 DEC 25  (2)  100 (Weeklys)")
+    const expiryMatch = line.match(/^(\d{1,2})\s+([A-Z]{3})\s+(\d{2})\s+\(\d+\)/);
+    if (expiryMatch) {
+      const [, day, month, year] = expiryMatch;
+      const monthNum = monthMap[month] || '01';
+      currentExpiry = `20${year}-${monthNum}-${day.padStart(2, '0')}`;
+      continue;
+    }
+    
+    // Skip header rows and empty lines
+    if (!currentExpiry || !line.trim() || line.includes('Delta,Gamma') || line.includes('UNDERLYING')) {
+      continue;
+    }
+    
+    // Parse data row
+    const parts = line.split(',').map(p => p.trim().replace(/"/g, ''));
+    
+    // Need at least enough columns for the format
+    if (parts.length < 28) continue;
+    
+    // Skip if no strike
+    const strike = parseFloat(parts[15]?.replace(/[^\d.]/g, '') || '0');
+    if (!strike || isNaN(strike)) continue;
+    
+    // Parse call data
+    const callGamma = parseNumberTOS(parts[3]);
+    const callOI = parseNumberTOS(parts[6]);
+    
+    if (callOI > 0) {
+      const callOption: OptionData = {
+        id: `SPX_${currentExpiry}_${strike}_call_${rowIndex}`,
+        symbol: `SPX${currentExpiry.replace(/-/g, '')}C${Math.round(strike * 1000).toString().padStart(8, '0')}`,
+        underlying: 'SPX',
+        expiry: currentExpiry,
+        strike,
+        optionType: 'call',
+        volume: parseNumberTOS(parts[7]),
+        openInterest: callOI,
+        delta: parseNumberTOS(parts[2]),
+        gamma: callGamma,
+        theta: parseNumberTOS(parts[4]),
+        vega: parseNumberTOS(parts[5]),
+        impliedVolatility: parsePercentTOS(parts[8]),
+        bid: parseNumberTOS(parts[10]),
+        ask: parseNumberTOS(parts[12]),
+        last: parseNumberTOS(parts[9]),
+        underlyingPrice,
+      };
+      data.push(callOption);
+    }
+    
+    // Parse put data
+    const putGamma = parseNumberTOS(parts[21]);
+    const putOI = parseNumberTOS(parts[24]);
+    
+    if (putOI > 0) {
+      const putOption: OptionData = {
+        id: `SPX_${currentExpiry}_${strike}_put_${rowIndex}`,
+        symbol: `SPX${currentExpiry.replace(/-/g, '')}P${Math.round(strike * 1000).toString().padStart(8, '0')}`,
+        underlying: 'SPX',
+        expiry: currentExpiry,
+        strike,
+        optionType: 'put',
+        volume: parseNumberTOS(parts[25]),
+        openInterest: putOI,
+        delta: parseNumberTOS(parts[20]),
+        gamma: putGamma,
+        theta: parseNumberTOS(parts[22]),
+        vega: parseNumberTOS(parts[23]),
+        impliedVolatility: parsePercentTOS(parts[26]),
+        bid: parseNumberTOS(parts[16]),
+        ask: parseNumberTOS(parts[18]),
+        last: parseNumberTOS(parts[27]),
+        underlyingPrice,
+      };
+      data.push(putOption);
+    }
+    
+    rowIndex++;
+  }
+  
+  if (data.length === 0) {
+    errors.push('No valid option data found in TOS format');
+  } else {
+    warnings.push(`Parsed ${data.length} options from TOS/StockAnalysis format`);
+    if (underlyingPrice > 0) {
+      warnings.push(`Detected underlying price: ${underlyingPrice.toFixed(2)}`);
+    }
+  }
+  
+  return {
+    success: data.length > 0,
+    data,
+    errors,
+    warnings,
+    rowCount: rowIndex,
+    validRowCount: data.length,
+  };
+}
+
+/**
+ * Parse number from TOS format (handles commas, <empty>, etc.)
+ */
+function parseNumberTOS(value: string | undefined): number {
+  if (!value || value === '<empty>' || value === '--' || value === '') return 0;
+  const cleaned = value.replace(/[,$\s"]/g, '');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+}
+
+/**
+ * Parse percentage from TOS format (e.g., "10.56%")
+ */
+function parsePercentTOS(value: string | undefined): number {
+  if (!value || value === '<empty>' || value === '--' || value === '') return 0;
+  const cleaned = value.replace(/[%\s"]/g, '');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num / 100; // Convert to decimal
+}
+
 // Common column name variations
 const COLUMN_VARIATIONS: Record<keyof CSVColumnMapping, string[]> = {
   symbol: ['symbol', 'ticker', 'option_symbol', 'optionsymbol', 'option symbol', 'contract'],
@@ -148,6 +315,12 @@ export function parseCSV(
   content: string,
   customMapping?: CSVColumnMapping
 ): CSVParseResult {
+  // Check for TOS/StockAnalysis format first
+  if (isTOSFormat(content)) {
+    console.log('Detected TOS/StockAnalysis format');
+    return parseTOSFormat(content);
+  }
+
   const errors: string[] = [];
   const warnings: string[] = [];
   const data: OptionData[] = [];
