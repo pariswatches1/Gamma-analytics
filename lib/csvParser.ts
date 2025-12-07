@@ -25,16 +25,22 @@ function parseTOSFormat(content: string): CSVParseResult {
   let currentExpiry = '';
   let rowIndex = 0;
   
-  // Parse underlying price from header (line 5 typically)
-  for (let i = 0; i < Math.min(10, lines.length); i++) {
+  // Parse underlying price - look for line after "UNDERLYING" header
+  // Format: LAST,LX,Net Chng,BID,BX,ASK,AX,Size,Volume,Open,High,Low
+  //         6870.40, ,0,6842.61, ,6898.63, ,<empty>,<empty>,0,0,0
+  for (let i = 0; i < Math.min(20, lines.length); i++) {
     const line = lines[i];
-    if (line && !line.includes('UNDERLYING') && !line.includes('LAST')) {
-      const parts = line.split(',');
-      if (parts.length > 0) {
-        const price = parseFloat(parts[0].replace(/[^\d.]/g, ''));
-        if (price > 100) { // Likely a stock price
-          underlyingPrice = price;
-          break;
+    if (line && line.includes('LAST') && line.includes('BID') && line.includes('ASK')) {
+      // Next line should have the price data
+      if (i + 1 < lines.length) {
+        const priceLine = lines[i + 1];
+        const parts = priceLine.split(',');
+        if (parts.length > 0) {
+          const price = parseFloat(parts[0].replace(/[^\d.]/g, ''));
+          if (price > 100 && price < 100000) { // Reasonable stock price range
+            underlyingPrice = price;
+            break;
+          }
         }
       }
     }
